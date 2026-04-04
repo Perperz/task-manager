@@ -220,6 +220,10 @@ This shows your commit history — you should see one commit with the message ab
 # Create a new repo on GitHub (the CLI will prompt for options)
 gh repo create task-manager --public --source=. --remote=origin
 
+# Stage and commit everything before pushing
+git add .
+git commit -m "Initial project structure with directory skeleton"
+
 # Push your code to GitHub
 git push -u origin main
 ```
