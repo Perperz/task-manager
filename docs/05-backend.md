@@ -13,16 +13,19 @@ Create the file `services/backend/requirements.txt`:
 ```text
 fastapi==0.115.0
 uvicorn[standard]==0.30.0
-motor==3.5.0
+motor==3.7.0
 pydantic[email]==2.8.0
 pydantic-settings==2.5.0
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
+bcrypt==3.2.2
 python-multipart==0.0.9
 python-dotenv==1.0.1
 pytest==8.3.0
 httpx==0.27.0
 ```
+
+> **Version pinning note:** `motor` must be `>=3.6` to work with current `pymongo` releases (older versions reference internal APIs that were removed). `bcrypt` must be pinned to `<4.0` because `passlib 1.7.4` relies on `bcrypt.__about__.__version__`, which was removed in `bcrypt 4.0`.
 
 What each package does:
 
@@ -35,6 +38,7 @@ What each package does:
 | `pydantic-settings` | Reads configuration from environment variables and `.env` files. |
 | `python-jose[cryptography]` | Creates and verifies JWT tokens. |
 | `passlib[bcrypt]` | Hashes and verifies passwords with the bcrypt algorithm. |
+| `bcrypt` | Pinned to `<4.0` for compatibility with `passlib 1.7.x`. |
 | `python-multipart` | Required by FastAPI to parse form data (used by the login form). |
 | `python-dotenv` | Loads `.env` files into environment variables. |
 | `pytest` | Test runner for unit and integration tests. |
@@ -189,7 +193,7 @@ def verify_token(token: str) -> dict | None:
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from app.utils.security import verify_token
-from app.database import users_collection
+from app import database
 from bson import ObjectId
 
 security = HTTPBearer()
@@ -223,7 +227,7 @@ async def get_current_user(
             detail="Token missing subject claim",
         )
 
-    user = await users_collection.find_one({"_id": ObjectId(user_id)})
+    user = await database.users_collection.find_one({"_id": ObjectId(user_id)})
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -235,6 +239,8 @@ async def get_current_user(
     return user
 ```
 
+> **Why `from app import database` instead of `from app.database import users_collection`?** The collection variables in `database.py` start as `None` and are only assigned when `connect_db()` runs at startup. Writing `from app.database import users_collection` copies the `None` value at import time — it will never see the real collection. Importing the *module* and accessing `database.users_collection` at call time always reads the current (post-startup) value.
+
 ---
 
 ## 5.6 Auth Service (`app/services/auth_service.py`)
@@ -244,7 +250,7 @@ async def get_current_user(
 
 from datetime import datetime, timezone
 from fastapi import HTTPException, status
-from app.database import users_collection
+from app import database
 from app.utils.security import hash_password, verify_password, create_access_token
 
 
@@ -257,14 +263,14 @@ async def register_user(user_data: dict) -> dict:
     4. Return an access token.
     """
     # Check for existing email
-    if await users_collection.find_one({"email": user_data["email"]}):
+    if await database.users_collection.find_one({"email": user_data["email"]}):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email already registered",
         )
 
     # Check for existing username
-    if await users_collection.find_one({"username": user_data["username"]}):
+    if await database.users_collection.find_one({"username": user_data["username"]}):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Username already taken",
@@ -281,7 +287,7 @@ async def register_user(user_data: dict) -> dict:
         "updated_at": datetime.now(timezone.utc),
     }
 
-    result = await users_collection.insert_one(user_doc)
+    result = await database.users_collection.insert_one(user_doc)
     user_id = str(result.inserted_id)
 
     token = create_access_token(data={"sub": user_id, "username": user_doc["username"]})
@@ -293,7 +299,7 @@ async def authenticate_user(email: str, password: str) -> dict:
     Authenticate a user by email and password.
     Returns an access token on success, raises 401 on failure.
     """
-    user = await users_collection.find_one({"email": email})
+    user = await database.users_collection.find_one({"email": email})
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -321,7 +327,7 @@ async def authenticate_user(email: str, password: str) -> dict:
 from datetime import datetime, timezone
 from bson import ObjectId
 from fastapi import HTTPException, status
-from app.database import tasks_collection
+from app import database
 
 
 def _task_to_dict(task: dict) -> dict:
@@ -347,7 +353,7 @@ async def create_task(task_data: dict, user_id: str) -> dict:
         "created_at": datetime.now(timezone.utc),
         "updated_at": datetime.now(timezone.utc),
     }
-    result = await tasks_collection.insert_one(task_doc)
+    result = await database.tasks_collection.insert_one(task_doc)
     task_doc["_id"] = result.inserted_id
     return _task_to_dict(task_doc)
 
@@ -368,10 +374,10 @@ async def get_tasks(
     if priority:
         query["priority"] = priority
 
-    total = await tasks_collection.count_documents(query)
+    total = await database.tasks_collection.count_documents(query)
     skip = (page - 1) * limit
 
-    cursor = tasks_collection.find(query).sort("created_at", -1).skip(skip).limit(limit)
+    cursor = database.tasks_collection.find(query).sort("created_at", -1).skip(skip).limit(limit)
     tasks = [_task_to_dict(doc) async for doc in cursor]
 
     return {"tasks": tasks, "total": total, "page": page, "limit": limit}
@@ -382,7 +388,7 @@ async def get_task_by_id(task_id: str) -> dict:
     if not ObjectId.is_valid(task_id):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid task ID")
 
-    task = await tasks_collection.find_one({"_id": ObjectId(task_id)})
+    task = await database.tasks_collection.find_one({"_id": ObjectId(task_id)})
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
     return _task_to_dict(task)
@@ -397,12 +403,12 @@ async def update_task(task_id: str, update_data: dict, user: dict) -> dict:
 
     update_data["updated_at"] = datetime.now(timezone.utc)
 
-    await tasks_collection.update_one(
+    await database.tasks_collection.update_one(
         {"_id": ObjectId(task_id)},
         {"$set": update_data},
     )
 
-    updated = await tasks_collection.find_one({"_id": ObjectId(task_id)})
+    updated = await database.tasks_collection.find_one({"_id": ObjectId(task_id)})
     return _task_to_dict(updated)
 
 
@@ -413,7 +419,7 @@ async def delete_task(task_id: str, user: dict) -> dict:
     if task["created_by"] != user["_id"] and user.get("role") != "admin":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
 
-    await tasks_collection.delete_one({"_id": ObjectId(task_id)})
+    await database.tasks_collection.delete_one({"_id": ObjectId(task_id)})
     return {"message": "Task deleted successfully"}
 ```
 
@@ -619,7 +625,7 @@ async def remove_task(
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 from bson import ObjectId
-from app.database import users_collection
+from app import database
 
 router = APIRouter(prefix="/api/users", tags=["users"])
 
@@ -652,7 +658,7 @@ async def list_users():
     Return all users (id, username, full_name).
     Useful for populating the task-assignment dropdown in the frontend.
     """
-    cursor = users_collection.find({}, {"hashed_password": 0})
+    cursor = database.users_collection.find({}, {"hashed_password": 0})
     users = [_user_to_profile(doc) async for doc in cursor]
     return users
 
@@ -666,7 +672,7 @@ async def get_user(user_id: str):
             detail="Invalid user ID",
         )
 
-    user = await users_collection.find_one(
+    user = await database.users_collection.find_one(
         {"_id": ObjectId(user_id)},
         {"hashed_password": 0},
     )
@@ -753,6 +759,16 @@ async def root():
 ---
 
 ## 5.12 Run and Test
+
+### Prerequisites — MongoDB must be running
+
+The backend connects to MongoDB on startup. If MongoDB is not running, the server will fail with a `ServerSelectionTimeoutError`. If you don't have MongoDB installed locally, the easiest way is to run it via Docker:
+
+```bash
+docker run -d --name mongodb -p 27017:27017 mongo:7
+```
+
+Verify it's running with `docker ps`. To stop/restart later: `docker stop mongodb` / `docker start mongodb`.
 
 ### Start the server
 
